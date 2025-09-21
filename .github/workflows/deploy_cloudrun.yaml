@@ -1,0 +1,21 @@
+name: Deploy Cloud Run (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Service folder (e.g., ingestion_pipeline_AQ)"
+        required: true
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: gcloud auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SA }}
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+      - name: Build & Deploy
+        run: echo "Implement build/deploy here"

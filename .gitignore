@@ -1,9 +1,7 @@
-@"
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*.egg-info/
 .ipynb_checkpoints/
 
 # Virtual envs
@@ -11,7 +9,13 @@ __pycache__/
 venv/
 env/
 
-# Tools/IDE
+# OS/IDE
 .vscode/
 .DS_Store
-"@ | Out-File -Encoding utf8 .gitignore
+
+# DBT
+target/
+dbt_packages/
+
+# Local artifacts
+*.log

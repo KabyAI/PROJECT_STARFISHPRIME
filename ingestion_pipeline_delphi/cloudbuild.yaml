@@ -1,0 +1,5 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build','-t','$_IMAGE','-f','ingestion_pipeline_delphi/Dockerfile','ingestion_pipeline_delphi']
+images:
+  - '$_IMAGE'
