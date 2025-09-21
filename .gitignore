@@ -1,0 +1,17 @@
+@"
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tools/IDE
+.vscode/
+.DS_Store
+"@ | Out-File -Encoding utf8 .gitignore
