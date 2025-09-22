@@ -7,6 +7,15 @@ from datetime import datetime, timedelta, timezone
 import requests
 from google.cloud import bigquery
 
+
+import sys, traceback
+
+API_KEY = os.environ.get("OPENAQ_API_KEY")
+if not API_KEY:
+    print("ERROR: OPENAQ_API_KEY is not set. In Cloud Run, attach the Secret as env.", file=sys.stderr)
+    sys.exit(1)
+
+
 PROJECT = os.environ["GOOGLE_CLOUD_PROJECT"]
 DATASET = os.environ.get("BQ_DATASET", "silver")
 TABLE   = f"{PROJECT}.{DATASET}.openaq_pm25_test"
