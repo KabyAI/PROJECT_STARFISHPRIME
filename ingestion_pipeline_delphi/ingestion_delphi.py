@@ -1,120 +1,78 @@
+# ingestion_pipeline_delphi/ingestion_delphi.py
 # Pull FluView (ILI) for California and upsert into BigQuery (idempotent).
-# Table schema: region STRING, epiweek INT64, wili FLOAT64, inserted_at TIMESTAMP
 
 import os
-import sys
 from datetime import datetime, timezone
-from typing import List, Dict, Any
-
 import requests
 import pandas as pd
 from google.cloud import bigquery
 
-
-# ---- Config from env ----
-PROJECT     = os.environ["GOOGLE_CLOUD_PROJECT"]           # set by your job update
+# --------- Config from environment ----------
+PROJECT     = os.environ["GOOGLE_CLOUD_PROJECT"]
 DATASET     = os.environ.get("BQ_DATASET", "silver")
 TABLE_NAME  = os.environ.get("TABLE", "fluview_test")
-BQ_LOCATION = os.environ.get("BQ_LOCATION", "EU")          # 'EU' (dataset) or a regional location
-REGION_CODE = os.environ.get("FLUVIEW_REGION", "ca")       # 'ca' = California
+BQ_LOCATION = os.environ.get("BQ_LOCATION")  # optional; defaults to dataset location
+# -----------------------------------------------------------
 
-# Week range (Delphi epiweeks). Default: 202401-202452 (this year).
-EPIWEEK_FROM = os.environ.get("FLUVIEW_FROM", "202401")
-EPIWEEK_TO   = os.environ.get("FLUVIEW_TO",   "202452")
+FINAL_TABLE = f"{PROJECT}.{DATASET}.{TABLE_NAME}"
 
-TABLE_FQN    = f"{PROJECT}.{DATASET}.{TABLE_NAME}"
-
-
-def _fetch_delphi(region: str, ew_from: str, ew_to: str) -> List[Dict[str, Any]]:
-    params = {
-        "source": "fluview",
-        "regions": region,
-        "epiweeks": f"{ew_from}-{ew_to}",
-    }
+def fetch_fluview_df() -> pd.DataFrame:
+    # CA region, 2024 epiweeks through 2025 epiweeks; adjust as you like
+    params = {"source": "fluview", "regions": "ca", "epiweeks": "202401-202552"}
     r = requests.get("https://api.delphi.cmu.edu/epidata/api.php", params=params, timeout=60)
     r.raise_for_status()
-    data = r.json()
-
-    if data.get("result") != 1 or "epidata" not in data:
-        # If result is not OK, return empty
-        return []
+    js = r.json()
+    if js.get("result") != 1:
+        raise RuntimeError(f"Delphi API error: {js}")
 
     rows = []
-    for it in data["epidata"]:
-        # Expected fields: region (str), epiweek (int), wili (float)
-        region = it.get("region")
-        epiweek = it.get("epiweek")
-        wili = it.get("wili")
-        if region is None or epiweek is None or wili is None:
-            continue
-        rows.append({"region": region, "epiweek": int(epiweek), "wili": float(wili)})
-
-    return rows
-
-
-def main():
-    print(f"Fetching FluView for {REGION_CODE} epiweeks {EPIWEEK_FROM}-{EPIWEEK_TO}")
-
-    rows = _fetch_delphi(REGION_CODE, EPIWEEK_FROM, EPIWEEK_TO)
-    if not rows:
-        print("Delphi returned no rows for the requested window.")
-        return
-
+    for rec in js.get("epidata", []):
+        rows.append({
+            "region": rec.get("region"),
+            "epiweek": int(rec.get("epiweek")),
+            "wili": float(rec.get("wili")) if rec.get("wili") is not None else None,
+        })
     df = pd.DataFrame(rows)
-    df["inserted_at"] = datetime.now(timezone.utc)
+    if df.empty:
+        return pd.DataFrame(columns=["region","epiweek","wili","inserted_at"])
+    df["inserted_at"] = datetime.now(timezone.utc).isoformat()
+    return df[["region","epiweek","wili","inserted_at"]]
 
-    print(f"FluView rows prepared: {len(df)}")
+def upsert_to_bq(df: pd.DataFrame):
+    bq = bigquery.Client(project=PROJECT)
+    stg_table_id = f"{PROJECT}.{DATASET}._fluview_stg"
 
-    bq = bigquery.Client(project=PROJECT, location=BQ_LOCATION)
-
-    # Stage then MERGE
-    stg_table_id = f"{PROJECT}.{DATASET}._stg_fluview"
-    target_table = TABLE_FQN
-
-    schema = [
-        bigquery.SchemaField("region", "STRING"),
-        bigquery.SchemaField("epiweek", "INT64"),
-        bigquery.SchemaField("wili", "FLOAT64"),
-        bigquery.SchemaField("inserted_at", "TIMESTAMP"),
-    ]
-
-    # Ensure staging exists fresh
-    stg_table = bigquery.Table(stg_table_id, schema=schema)
-    stg_table = bq.create_table(stg_table, exists_ok=True)
-    bq.delete_table(stg_table, not_found_ok=True)
-    stg_table = bq.create_table(bigquery.Table(stg_table_id, schema=schema))
-
+    # Load staging
     job = bq.load_table_from_dataframe(df, stg_table_id)
     job.result()
 
-    # Ensure target exists
-    try:
-        bq.get_table(target_table)
-    except Exception:
-        tgt = bigquery.Table(target_table, schema=schema)
-        bq.create_table(tgt)
-
     merge_sql = f"""
-    MERGE `{target_table}` T
+    MERGE `{FINAL_TABLE}` T
     USING `{stg_table_id}` S
-    ON T.region = S.region
-       AND T.epiweek = S.epiweek
+    ON  T.region = S.region
+    AND T.epiweek = S.epiweek
     WHEN MATCHED THEN UPDATE SET
-      wili = S.wili,
+      wili        = S.wili,
       inserted_at = S.inserted_at
-    WHEN NOT MATCHED THEN
-      INSERT (region, epiweek, wili, inserted_at)
+    WHEN NOT MATCHED THEN INSERT (region, epiweek, wili, inserted_at)
       VALUES (S.region, S.epiweek, S.wili, S.inserted_at)
     """
-    bq.query(merge_sql).result()
+    bq.query(merge_sql, location=BQ_LOCATION).result()
+    bq.delete_table(stg_table_id, not_found_ok=True)
 
-    bq.delete_table(stg_table, not_found_ok=True)
-    print(f"Upserted {len(df)} rows into {target_table}")
+def main():
+    print(
+        f"[Delphi] project={PROJECT} dataset={DATASET} table={FINAL_TABLE} "
+        f"bq_loc={BQ_LOCATION or 'dataset default'}"
+    )
+    df = fetch_fluview_df()
+    print(f"[Delphi] rows prepared: {len(df)}")
 
+    if not df.empty:
+        upsert_to_bq(df)
+        print(f"[Delphi] upserted {len(df)} rows into {FINAL_TABLE}")
+    else:
+        print("[Delphi] nothing to upsert (no rows returned).")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"FATAL: {e}", file=sys.stderr)
-        raise
+    main()
