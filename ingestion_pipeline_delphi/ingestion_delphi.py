@@ -11,6 +11,7 @@ DATASET = os.environ.get("BQ_DATASET", "silver")
 TABLE   = f"{PROJECT}.{DATASET}.fluview_test"
 
 def main():
+    
     # Small recent range; adjust as you like
     params = {"source": "fluview", "regions": "ca", "epiweeks": "202401-202452"}
     r = requests.get("https://api.delphi.cmu.edu/epidata/api.php", params=params, timeout=60)

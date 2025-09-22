@@ -35,6 +35,7 @@ def polite_get(url, params, tries=0):
     return r.json()
 
 def main():
+    print(f"Fetching OpenAQ days for sensor=957 from {date_from} to {date_to} (UTC)")
     # Known-good sensor for a quick smoke test; change later if you want.
     sensor_id = 957
 
@@ -89,4 +90,10 @@ def main():
     print(f"Upserted {len(rows_out)} rows into {TABLE}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("FATAL:", e, file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(2)
+
