@@ -25,6 +25,7 @@ import sys
 import time
 import json
 import math
+import io
 import datetime as dt
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -334,7 +335,7 @@ def load_rows(
     # stream via a tempfile-like bytes buffer
     body = "\n".join(json.dumps(x, ensure_ascii=False) for x in payload).encode("utf-8")
     load_job = client.load_table_from_file(
-        file_obj=os.BytesIO(body),  # type: ignore
+        file_obj=io.BytesIO(body),  # type: ignore
         destination=table_id,
         job_config=job_config,
         location=location,
