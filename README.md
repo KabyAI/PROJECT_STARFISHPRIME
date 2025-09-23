@@ -1,5 +1,7 @@
 # PROJECT_STARFISHPRIME
 
+![PROJECT-STARFISHPRIME Logo](images/starfishprime_3d_text_cool.png)
+
 Data platform for air quality + ILI forecasting.
 
 ## Structure
