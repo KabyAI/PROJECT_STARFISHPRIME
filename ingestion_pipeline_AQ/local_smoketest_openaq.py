@@ -5,7 +5,8 @@ import os
 import sys
 import time
 from typing import Iterable, List, Tuple, Optional, Dict, Any
-
+from dotenv import load_dotenv
+load_dotenv()  
 import requests
 
 OPENAQ_BASE = "https://api.openaq.org/v3"
