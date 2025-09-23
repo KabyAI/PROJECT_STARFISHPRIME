@@ -3,10 +3,10 @@ WITH d AS (
     DATE(date) AS dte,
     region,
     temp_mean, temp_max, temp_min
-  FROM {{ ref('weather_ca_daily') }}  
+  FROM {{ ref('weather_ca_daily') }}
 ),
 e AS (
-  SELECT * FROM {{ ref('dim_epiweeks') }}  
+  SELECT * FROM {{ ref('dim_epiweeks') }}
 )
 SELECT
   'ca' AS region,
