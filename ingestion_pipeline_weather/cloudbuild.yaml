@@ -1,0 +1,10 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build','-t','$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/ingest-openmeteo:1','.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push','$_REGION-docker.pkg.dev/$PROJECT_ID/$_REPO/ingest-openmeteo:1']
+substitutions:
+  _REGION: europe-north2
+  _REPO: starfish-docker
+images:
+  - 'europe-north2-docker.pkg.dev/$PROJECT_ID/starfish-docker/ingest-openmeteo:1'
