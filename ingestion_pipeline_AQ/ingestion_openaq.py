@@ -1,48 +1,27 @@
 #!/usr/bin/env python3
-"""
-OpenAQ v3 -> BigQuery ingestion (PM2.5, multi-bbox, multi-sensor).
+# -*- coding: utf-8 -*-
 
-Env vars (typical for your job.env.yaml):
-  GOOGLE_CLOUD_PROJECT   e.g. project-starfishprime-001
-  BQ_DATASET             e.g. silver
-  BQ_TABLE               e.g. openaq_pm25_test
-  BQ_LOCATION            e.g. europe-north2
-  OPENAQ_API_KEY         secret (injected via --set-secrets)
-  BBOXES                 pipe-separated bboxes: "lon1,lat1,lon2,lat2|..."
-  PER_BBOX               how many sensors to sample per bbox (default 20)
-  HOURS                  lookback window in hours (default 720)
-  DAYS_FALLBACK          if no rows in HOURS, look back this many days (default 3650)
-  SLEEP_MS               delay between /measurements calls (default 250)
-  DEBUG                  "1" to print sample raw payload when no datetime is found
-
-NOTE: This script *does not* call /locations/{id}/latest. It uses the stable
-      /sensors/{id}/measurements endpoint like your working smoketest.
-"""
-
-from __future__ import annotations
 import os
+import io
+import json
 import sys
 import time
-import json
-import math
-import io
 import datetime as dt
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Tuple, Optional, Dict, Any
 
 import requests
 from google.cloud import bigquery
 
 OPENAQ_BASE = "https://api.openaq.org/v3"
 
-
-# ----------------------- HTTP helper -----------------------
+# --------------- HTTP with backoff (429/5xx) -----------------
 def get_with_backoff(
     s: requests.Session,
     url: str,
-    params: Dict[str, Any] | None = None,
+    params: Optional[dict] = None,
     max_tries: int = 6,
-    base_delay: float = 0.5,
-) -> requests.Response:
+    base_delay: float = 0.6,
+):
     delay = base_delay
     for i in range(1, max_tries + 1):
         r = s.get(url, params=params, timeout=30)
@@ -56,36 +35,28 @@ def get_with_backoff(
         return r
 
 
-# ----------------------- OpenAQ helpers -----------------------
-def list_locations_in_bbox(
-    s: requests.Session, bbox: str, limit: int = 1000
-) -> List[Dict[str, Any]]:
-    params = {
-        "bbox": bbox,
-        "parameters_id": 2,  # PM2.5
-        "limit": limit,
-        "page": 1,
-    }
+# --------------- OpenAQ helpers (v3) -------------------------
+def list_locations_in_bbox(s: requests.Session, bbox: str, limit=1000) -> List[dict]:
+    # parameters_id=2 -> PM2.5
+    params = {"bbox": bbox, "parameters_id": 2, "limit": limit, "page": 1}
     r = get_with_backoff(s, f"{OPENAQ_BASE}/locations", params=params)
     return r.json().get("results", [])
 
 
 def list_pm25_sensors_for_location(
-    s: requests.Session, location_id: int, per_location_limit: int = 50
-) -> List[Dict[str, Any]]:
+    s: requests.Session, location_id: int, per_location_limit=50
+) -> List[dict]:
     url = f"{OPENAQ_BASE}/locations/{location_id}/sensors"
     params = {"limit": per_location_limit, "page": 1}
     r = get_with_backoff(s, url, params=params)
     sensors = r.json().get("results", [])
-    out: List[Dict[str, Any]] = []
-
+    out = []
     for sr in sensors:
-        pid = sr.get("parameter_id") or (sr.get("parameter") or {}).get("id") or sr.get("parameterId")
-        pcode = (sr.get("parameter") or {}).get("code") or sr.get("parameterCode") or ""
+        pid = sr.get("parameter_id") or (sr.get("parameter") or {}).get("id")
+        pcode = (sr.get("parameter") or {}).get("code") or ""
         is_pm25 = (pid == 2) or (str(pcode).lower() in ("pm25", "pm2.5", "pm2_5"))
         if not is_pm25:
             continue
-
         unit_hint = (
             sr.get("unit")
             or (sr.get("parameter") or {}).get("preferredUnit")
@@ -93,17 +64,12 @@ def list_pm25_sensors_for_location(
         )
         if unit_hint:
             sr["_unit_hint"] = unit_hint
-
         out.append(sr)
     return out
 
 
 def _pick_datetime(m: Dict[str, Any]) -> Optional[str]:
-    """Coalesce UTC timestamp from an OpenAQ measurement object."""
-    if not isinstance(m, dict):
-        return None
-
-    # 1) canonical v3 pattern: "datetime" object/dict or string
+    # 1) canonical "datetime" object
     dt_obj = m.get("datetime")
     if isinstance(dt_obj, dict):
         utc = dt_obj.get("utc") or dt_obj.get("UTC")
@@ -111,8 +77,7 @@ def _pick_datetime(m: Dict[str, Any]) -> Optional[str]:
             return utc
     elif isinstance(dt_obj, str) and dt_obj:
         return dt_obj
-
-    # 2) "period" block: prefer end of interval
+    # 2) period.datetimeTo/From
     period = m.get("period")
     if isinstance(period, dict):
         dto = period.get("datetimeTo")
@@ -125,33 +90,38 @@ def _pick_datetime(m: Dict[str, Any]) -> Optional[str]:
             utc = dfrom.get("utc") or dfrom.get("UTC")
             if isinstance(utc, str) and utc:
                 return utc
-
-    # 3) other flat keys sometimes present
-    for k in ("datetime_utc", "date_utc", "observed_at", "observedAt", "lastUpdated", "last_updated", "time", "timestamp"):
+    # 3) flat fields
+    for k in (
+        "datetime_utc",
+        "date_utc",
+        "observed_at",
+        "observedAt",
+        "lastUpdated",
+        "last_updated",
+        "time",
+        "timestamp",
+    ):
         v = m.get(k)
         if isinstance(v, str) and v:
             return v
-
-    # 4) nested date object (older harmonized shape)
+    # 4) nested "date"
     date_obj = m.get("date")
     if isinstance(date_obj, dict):
         for k in ("utc", "UTC", "iso"):
             v = date_obj.get(k)
             if isinstance(v, str) and v:
                 return v
-
-    # 5) some feeds return strings in period.to / period.end
+    # 5) period.to / end
     if isinstance(period, dict):
         v = period.get("to") or period.get("end")
         if isinstance(v, str) and v:
             return v
-
     return None
 
 
 def latest_measurement_for_sensor(
     s: requests.Session, sensor_id: int, date_from_iso: str, date_to_iso: str
-) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+) -> Tuple[Optional[float], Optional[str], Optional[str]]:
     url = f"{OPENAQ_BASE}/sensors/{sensor_id}/measurements"
     params = {
         "date_from": date_from_iso,
@@ -162,34 +132,63 @@ def latest_measurement_for_sensor(
     r = get_with_backoff(s, url, params=params)
     results = r.json().get("results", [])
     if not results:
-        return None, None, None, None
+        return None, None, None
     m = results[0]
     value = m.get("value")
     unit = m.get("unit") or (m.get("parameter") or {}).get("units")
     when = _pick_datetime(m)
-    return value, unit, when, m
+    return value, unit, when
 
 
-# ----------------------- Core sweep -----------------------
-def sweep_openaq(
-    api_key: str,
+def latest_for_location(
+    s: requests.Session, location_id: int
+) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    """
+    Fallback if a sensor returns no recent measurements:
+    /locations/{id}/latest?limit=1 returns the latest value across parameters.
+    We filter to PM2.5 where possible.
+    """
+    url = f"{OPENAQ_BASE}/locations/{location_id}/latest"
+    params = {"limit": 1}
+    r = get_with_backoff(s, url, params=params)
+    results = r.json().get("results", [])
+    if not results:
+        return None, None, None
+    m = results[0]
+    pid = m.get("parameter_id") or (m.get("parameter") or {}).get("id")
+    pcode = (m.get("parameter") or {}).get("code") or ""
+    if not (pid == 2 or str(pcode).lower() in ("pm25", "pm2.5", "pm2_5")):
+        return None, None, None
+    value = m.get("value")
+    unit = m.get("unit") or (m.get("parameter") or {}).get("units")
+    when = _pick_datetime(m)
+    return value, unit, when
+
+
+# --------------- Collection (multi-bbox sweep) ---------------
+def collect_rows(
     bboxes: Iterable[str],
     per_bbox: int,
     hours: int,
+    days_fallback: int,
     sleep_ms: int,
+    api_key: str,
     debug: bool = False,
-) -> List[Dict[str, Any]]:
+) -> List[Tuple]:
     headers = {"X-API-Key": api_key} if api_key else {}
     s = requests.Session()
     s.headers.update(headers)
 
-    # time window
-    now_utc = dt.datetime.now(dt.UTC).replace(microsecond=0)
-    frm = now_utc - dt.timedelta(hours=hours)
+    # Primary lookback window
+    to_ = dt.datetime.now(dt.UTC).replace(microsecond=0)
+    frm = to_ - dt.timedelta(hours=hours)
     date_from = frm.isoformat().replace("+00:00", "Z")
-    date_to = now_utc.isoformat().replace("+00:00", "Z")
+    date_to = to_.isoformat().replace("+00:00", "Z")
 
-    rows: List[Dict[str, Any]] = []
+    # Wider fallback for /sensors/* if necessary
+    wide_from = (to_ - dt.timedelta(days=days_fallback)).isoformat().replace("+00:00", "Z")
+
+    rows: List[Tuple] = []
 
     for bbox in bboxes:
         print(f"Finding PM2.5 locations in bbox: {bbox}", flush=True)
@@ -199,197 +198,272 @@ def sweep_openaq(
             print(f"  ERROR listing locations for bbox {bbox}: {e}", flush=True)
             continue
 
-        # filter obvious temporary/test sites
-        filtered: List[Dict[str, Any]] = []
+        # prune obvious junk/test locations
+        filtered = []
         for L in locs:
             name = str(L.get("name", "")).lower()
-            if any(x in name for x in ("ebam", "temporary", "decommissioned", "pilot", "test", "unit", "mammoth", "gbuapcd")):
+            if any(
+                x in name
+                for x in (
+                    "ebam",
+                    "temporary",
+                    "decommissioned",
+                    "pilot",
+                    "test",
+                    "unit",
+                    "mammoth",
+                    "gbuapcd",
+                )
+            ):
                 continue
             filtered.append(L)
 
-        # gather up to per_bbox sensors
-        picked: List[Dict[str, Any]] = []
+        picked: List[dict] = []
         for L in filtered:
             if len(picked) >= per_bbox:
                 break
-            lid = L["id"]
+            lid = L.get("id")
+            if lid is None:
+                continue
             try:
-                sensors = list_pm25_sensors_for_location(s, lid)
+                sensors = list_pm25_sensors_for_location(s, int(lid))
             except requests.HTTPError as e:
                 print(f"  WARN sensors for location {lid}: {e}", flush=True)
                 continue
-
             for sen in sensors:
                 if len(picked) >= per_bbox:
                     break
                 sen["_location"] = L
                 picked.append(sen)
 
-        # get latest measurement per sensor
         for sen in picked:
-            sid = sen["id"]
+            sid = sen.get("id")
+            if sid is None:
+                continue
             loc = sen["_location"]
-            loc_id = loc["id"]
+            loc_id = loc.get("id")
             loc_name = loc.get("name", "")
             coords = loc.get("coordinates") or {}
             lat = coords.get("latitude")
             lon = coords.get("longitude")
 
+            # Try tight window first
             try:
-                val, unit, when, raw = latest_measurement_for_sensor(s, sid, date_from, date_to)
+                val, unit, when = latest_measurement_for_sensor(s, int(sid), date_from, date_to)
             except requests.HTTPError as e:
                 print(f"  WARN measurement for sensor {sid}: {e}", flush=True)
-                continue
+                val = unit = when = None
 
-            if not unit:
-                unit = (
-                    sen.get("_unit_hint")
-                    or (sen.get("parameter") or {}).get("preferredUnit")
-                    or (sen.get("parameter") or {}).get("unit")
-                )
-                pid = sen.get("parameter_id") or (sen.get("parameter") or {}).get("id")
-                if not unit and pid == 2:
-                    unit = "µg/m³"
+            # Fallback to a much wider sensor window if nothing found
+            if val is None or when is None:
+                try:
+                    val2, unit2, when2 = latest_measurement_for_sensor(s, int(sid), wide_from, date_to)
+                except requests.HTTPError:
+                    val2 = unit2 = when2 = None
+                if val2 is not None and when2 is not None:
+                    val, unit, when = val2, unit2, when2
 
+            # Fallback to location-level latest
+            if val is None or when is None:
+                try:
+                    lv, lu, lw = latest_for_location(s, int(loc_id))
+                except requests.HTTPError:
+                    lv = lu = lw = None
+                if lv is not None and lw is not None:
+                    val, unit, when = lv, lu, lw
+
+            # Unit fallback for PM2.5 if still missing
             if val is not None:
-                if not when and debug and raw:
-                    print(f"  DEBUG sensor {sid}: no datetime found; sample raw result:\n    {raw}", flush=True)
-                rows.append(
-                    {
-                        "SensorId": sid,
-                        "LocationId": loc_id,
-                        "LocationName": loc_name,
-                        "Lat": lat,
-                        "Lon": lon,
-                        "Value": val,
-                        "Unit": unit,
-                        "DateTimeUTC": when,  # string ISO; we’ll coerce to TIMESTAMP on load
-                    }
-                )
+                if not unit:
+                    unit = (
+                        sen.get("_unit_hint")
+                        or (sen.get("parameter") or {}).get("preferredUnit")
+                        or (sen.get("parameter") or {}).get("unit")
+                        or ("µg/m³" if (sen.get("parameter_id") == 2) else None)
+                    )
+                rows.append((sid, loc_id, loc_name, lat, lon, val, unit, when))
             time.sleep(sleep_ms / 1000.0)
 
     return rows
 
 
-# ----------------------- BigQuery I/O -----------------------
-def ensure_table(client: bigquery.Client, dataset: str, table: str, location: str) -> bigquery.Table:
-    ds_ref = bigquery.DatasetReference(client.project, dataset)
-    try:
-        client.get_dataset(ds_ref)
-    except Exception:
-        # dataset should exist already in your setup; create if missing
-        ds = bigquery.Dataset(ds_ref)
-        ds.location = location
-        client.create_dataset(ds, exists_ok=True)
-
-    table_id = f"{client.project}.{dataset}.{table}"
-    schema = [
-        bigquery.SchemaField("SensorId", "INT64"),
-        bigquery.SchemaField("LocationId", "INT64"),
-        bigquery.SchemaField("LocationName", "STRING"),
-        bigquery.SchemaField("Lat", "FLOAT64"),
-        bigquery.SchemaField("Lon", "FLOAT64"),
-        bigquery.SchemaField("Value", "FLOAT64"),
-        bigquery.SchemaField("Unit", "STRING"),
-        bigquery.SchemaField("DateTimeUTC", "TIMESTAMP"),
-    ]
-    table_ref = bigquery.Table(table_id, schema=schema)
-    return client.create_table(table_ref, exists_ok=True)
-
-
+# --------------- BigQuery load + MERGE -----------------------
 def load_rows(
     client: bigquery.Client,
     dataset: str,
-    table: str,
+    target_table: str,
     location: str,
-    rows: List[Dict[str, Any]],
-) -> None:
+    rows: List[Tuple],
+):
+    """
+    rows are tuples: (sensor_id, location_id, location_name, lat, lon, value, unit, when_iso)
+    Load to a fresh staging table with autodetect (PascalCase keys),
+    then MERGE into target with snake_case schema.
+    """
     if not rows:
-        print("No OpenAQ rows fetched for the requested sweep. Exiting gracefully.")
+        print("No OpenAQ rows fetched for the requested sweep. Exiting gracefully.", flush=True)
         return
 
-    ensure_table(client, dataset, table, location)
-
-    # Convert DateTimeUTC (str|None) -> None or RFC3339 for TIMESTAMP
-    def to_rfc3339(s: Optional[str]) -> Optional[str]:
-        if not s:
-            return None
-        # Trust Z; otherwise add Z if naive
-        if s.endswith("Z") or "+" in s:
-            return s
-        return s + "Z"
+    # 1) upload NDJSON to a unique staging table
+    staging = f"_stg_openaq_{int(time.time())}"
+    staging_fq = f"{client.project}.{dataset}.{staging}"
 
     payload = []
-    for r in rows:
-        rec = dict(r)
-        rec["DateTimeUTC"] = to_rfc3339(r.get("DateTimeUTC"))
-        payload.append(rec)
+    for sid, loc_id, loc_name, lat, lon, val, unit, when in rows:
+        payload.append(
+            {
+                "SensorId": sid,
+                "LocationId": loc_id,
+                "LocationName": loc_name,
+                "Lat": lat,
+                "Lon": lon,
+                "Value": val,
+                "Unit": unit,
+                "DateTimeUTC": when,
+            }
+        )
+
+    body = "\n".join(json.dumps(x, ensure_ascii=False) for x in payload).encode("utf-8")
+    buf = io.BytesIO(body)
 
     job_config = bigquery.LoadJobConfig(
-        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_RELAXATION],
+        autodetect=True,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
     )
 
-    table_id = f"{client.project}.{dataset}.{table}"
-    # stream via a tempfile-like bytes buffer
-    body = "\n".join(json.dumps(x, ensure_ascii=False) for x in payload).encode("utf-8")
     load_job = client.load_table_from_file(
-        file_obj=io.BytesIO(body),  # type: ignore
-        destination=table_id,
-        job_config=job_config,
-        location=location,
+        file_obj=buf, destination=staging_fq, job_config=job_config, location=location
     )
     load_job.result()
-    print(f"Loaded {len(rows)} rows into {table_id}.")
+    print(f"[BQ] Loaded {load_job.output_rows} rows to {staging_fq}", flush=True)
+
+    # 2) ensure target table exists (snake_case), partitioned by date(datetime_utc)
+    target_fq = f"{client.project}.{dataset}.{target_table}"
+    ensure_sql = f"""
+    CREATE TABLE IF NOT EXISTS `{target_fq}` (
+      sensor_id     INT64,
+      location_id   INT64,
+      location_name STRING,
+      latitude      FLOAT64,
+      longitude     FLOAT64,
+      value         FLOAT64,
+      unit          STRING,
+      datetime_utc  TIMESTAMP
+    )
+    PARTITION BY DATE(datetime_utc)
+    CLUSTER BY location_id, sensor_id;
+    """
+    client.query(
+        ensure_sql, job_config=bigquery.QueryJobConfig(location=location)
+    ).result()
+
+    # 3) MERGE from staging, mapping PascalCase -> snake_case & deduplicating on keys
+    merge_sql = f"""
+    MERGE `{target_fq}` T
+    USING (
+      SELECT
+        CAST(SensorId     AS INT64)   AS sensor_id,
+        CAST(LocationId   AS INT64)   AS location_id,
+        CAST(LocationName AS STRING)  AS location_name,
+        CAST(Lat          AS FLOAT64) AS latitude,
+        CAST(Lon          AS FLOAT64) AS longitude,
+        CAST(Value        AS FLOAT64) AS value,
+        CAST(Unit         AS STRING)  AS unit,
+        TIMESTAMP(DateTimeUTC)        AS datetime_utc
+      FROM `{staging_fq}`
+      WHERE DateTimeUTC IS NOT NULL
+    ) S
+    ON  T.sensor_id    = S.sensor_id
+    AND T.location_id  = S.location_id
+    AND T.datetime_utc = S.datetime_utc
+    WHEN MATCHED THEN
+      UPDATE SET
+        location_name = S.location_name,
+        latitude      = S.latitude,
+        longitude     = S.longitude,
+        value         = S.value,
+        unit          = S.unit
+    WHEN NOT MATCHED THEN
+      INSERT (sensor_id, location_id, location_name, latitude, longitude, value, unit, datetime_utc)
+      VALUES (S.sensor_id, S.location_id, S.location_name, S.latitude, S.longitude, S.value, S.unit, S.datetime_utc);
+    """
+    client.query(
+        merge_sql, job_config=bigquery.QueryJobConfig(location=location)
+    ).result()
+    print(f"[BQ] MERGE into {target_fq} completed.", flush=True)
 
 
-# ----------------------- Entry -----------------------
-def main() -> None:
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID")
-    dataset = os.environ.get("BQ_DATASET", "silver")
-    table = os.environ.get("BQ_TABLE", "openaq_pm25_test")
-    location = os.environ.get("BQ_LOCATION", "europe-north2")
-    api_key = os.environ.get("OPENAQ_API_KEY", "")
+# --------------- main ----------------------------------------
+def parse_bboxes(env_str: Optional[str]) -> List[str]:
+    """
+    BBOXES looks like:
+    -118.6681,33.7037,-117.6462,34.3373|-122.5136,37.7080,-122.3569,37.8324|-117.282,32.615,-116.908,33.023
+    """
+    if not env_str:
+        # default to LA, SF, SD
+        return [
+            "-118.6681,33.7037,-117.6462,34.3373",
+            "-122.5136,37.7080,-122.3569,37.8324",
+            "-117.282,32.615,-116.908,33.023",
+        ]
+    parts = [p.strip() for p in env_str.split("|") if p.strip()]
+    return parts or []
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "t", "yes", "y", "on")
+
+
+def main():
+    project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
+    dataset = os.getenv("BQ_DATASET", "silver")
+    table = os.getenv("BQ_TABLE", "openaq_pm25_test")
+    location = os.getenv("BQ_LOCATION", "europe-north2")
+
+    api_key = os.getenv("OPENAQ_API_KEY", "")
+    if not api_key:
+        print("Missing OPENAQ_API_KEY (use Secret Manager binding).", file=sys.stderr)
+        sys.exit(2)
+
+    bboxes = parse_bboxes(os.getenv("BBOXES"))
+    per_bbox = env_int("PER_BBOX", 20)
+    hours = env_int("HOURS", 720)  # 30 days as hours
+    days_fallback = env_int("DAYS_FALLBACK", 3650)  # ~10 years
+    sleep_ms = env_int("SLEEP_MS", 250)
+    debug = env_bool("DEBUG", False)
 
     if not project:
-        print("GOOGLE_CLOUD_PROJECT is required.", file=sys.stderr)
-        sys.exit(2)
-    if not api_key:
-        print("OPENAQ_API_KEY is not set (secret).", file=sys.stderr)
+        print("Missing GOOGLE_CLOUD_PROJECT.", file=sys.stderr)
         sys.exit(2)
 
-    # BBOXES parsing (pipe-separated)
-    raw_bboxes = os.environ.get("BBOXES", "").strip()
-    if not raw_bboxes:
-        # sensible default to your three metros
-        raw_bboxes = (
-            "-118.6681,33.7037,-117.6462,34.3373|"
-            "-122.5136,37.7080,-122.3569,37.8324|"
-            "-117.282,32.615,-116.908,33.023"
-        )
-    bboxes = [b.strip() for b in raw_bboxes.split("|") if b.strip()]
+    # Collect
+    rows = collect_rows(
+        bboxes=bboxes,
+        per_bbox=per_bbox,
+        hours=hours,
+        days_fallback=days_fallback,
+        sleep_ms=sleep_ms,
+        api_key=api_key,
+        debug=debug,
+    )
 
-    per_bbox = int(os.environ.get("PER_BBOX", "20"))
-    hours = int(os.environ.get("HOURS", "720"))
-    days_fallback = int(os.environ.get("DAYS_FALLBACK", "3650"))
-    sleep_ms = int(os.environ.get("SLEEP_MS", "250"))
-    debug = os.environ.get("DEBUG", "0") == "1"
+    if not rows:
+        print("No OpenAQ rows fetched for the requested sweep. Exiting gracefully.", flush=True)
+        sys.exit(0)
 
-    # First sweep in the configured HOURS window
-    rows = sweep_openaq(api_key, bboxes, per_bbox, hours, sleep_ms, debug=debug)
-
-    # Optional fallback: if no rows, try a large historical window
-    if not rows and days_fallback and days_fallback > 0:
-        print(f"No rows in HOURS={hours}. Falling back to DAYS_FALLBACK={days_fallback}.", flush=True)
-        # Recompute window by days
-        now_utc = dt.datetime.now(dt.UTC).replace(microsecond=0)
-        frm = now_utc - dt.timedelta(days=days_fallback)
-        os.environ["HOURS"] = str(max(1, days_fallback * 24))
-        rows = sweep_openaq(api_key, bboxes, per_bbox, days_fallback * 24, sleep_ms, debug=debug)
-
-    # Load to BigQuery
-    client = bigquery.Client(project=project, location=location)
+    # Load
+    client = bigquery.Client(project=project)
     load_rows(client, dataset, table, location, rows)
 
 
