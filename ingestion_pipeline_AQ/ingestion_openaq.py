@@ -1,247 +1,301 @@
+#!/usr/bin/env python3
+from __future__ import annotations
 import os
 import sys
-import math
 import time
+import math
+import json
 import datetime as dt
-from typing import List, Dict
+from typing import Any, Dict, List, Optional, Iterable
 
-import pandas as pd
 import requests
 from google.cloud import bigquery
 
-# -----------------------------
-# Configuration (env-driven)
-# -----------------------------
-PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
-if not PROJECT:
-    print("FATAL: GOOGLE_CLOUD_PROJECT (or PROJECT_ID) is not set.", file=sys.stderr)
-    sys.exit(1)
+OPENAQ_BASE = "https://api.openaq.org/v3"
 
-BQ_DATASET  = os.getenv("BQ_DATASET", "silver")
-BQ_TABLE    = os.getenv("TABLE", "openaq_pm25")
-BQ_LOCATION = os.getenv("BQ_LOCATION", "europe-north2")
+# -------- env --------
+PROJECT_ID      = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+BQ_DATASET      = os.getenv("BQ_DATASET", "silver")              # <- keep writing to silver
+BQ_TABLE        = os.getenv("BQ_TABLE", "openaq_pm25_test")
+BQ_LOCATION     = os.getenv("BQ_LOCATION", "europe-north2")
+OPENAQ_API_KEY  = os.getenv("OPENAQ_API_KEY", "")                # set via Secret
+# Pipe-separated list of bboxes (lon1,lat1,lon2,lat2)
+# Default: LA, SF, SD (same as your smoketest)
+BBOXES          = os.getenv("BBOXES", "-118.6681,33.7037,-117.6462,34.3373|"
+                                      "-122.5136,37.7080,-122.3569,37.8324|"
+                                      "-117.282,32.615,-116.908,33.023")
+PER_BBOX        = int(os.getenv("PER_BBOX", "10"))               # locations to sample per bbox
+SLEEP_MS        = int(os.getenv("SLEEP_MS", "250"))              # delay between API calls
+PARAMETER_ID    = int(os.getenv("PARAMETER_ID", "2"))            # 2 = pm2.5
+PARAMETER_CODE  = os.getenv("PARAMETER", "pm25")
 
-# OpenAQ v3 settings
-OPENAQ_API_KEY   = os.getenv("OPENAQ_API_KEY")   # required in production
-OPENAQ_BASE      = "https://api.openaq.org/v3"
-OPENAQ_LOCATION_ID = int(os.getenv("OPENAQ_LOCATION_ID", "957"))  # sample location
-OPENAQ_PARAMETER   = os.getenv("OPENAQ_PARAMETER", "pm25")
+# -------- requests session with backoff --------
+def build_session() -> requests.Session:
+    s = requests.Session()
+    if OPENAQ_API_KEY:
+        s.headers.update({"X-API-Key": OPENAQ_API_KEY})
+    s.headers.update({"Accept": "application/json", "User-Agent": "starfishprime-ingestor/1.0"})
+    adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=3)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
-# Day window (UTC): inclusive day range (start..end) in "days ago"
-START_DAYS_AGO = int(os.getenv("OPENAQ_DAYS_AGO_START", "1"))
-END_DAYS_AGO   = int(os.getenv("OPENAQ_DAYS_AGO_END", "1"))
-if START_DAYS_AGO < END_DAYS_AGO:
-    START_DAYS_AGO, END_DAYS_AGO = END_DAYS_AGO, START_DAYS_AGO
+def get_with_backoff(s: requests.Session, url: str, params=None, max_tries=6, base_delay=0.6):
+    delay = base_delay
+    for i in range(1, max_tries + 1):
+        r = s.get(url, params=params, timeout=30)
+        if r.status_code in (429, 500, 502, 503, 504):
+            if i == max_tries:
+                r.raise_for_status()
+            time.sleep(delay)
+            delay = min(12.0, round(delay * 1.8, 2))
+            continue
+        r.raise_for_status()
+        return r
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def day_bounds_utc(days_ago: int) -> tuple[dt.datetime, dt.datetime]:
-    """Return 00:00:00Z and 23:59:59Z for the UTC day that is `days_ago` before today."""
-    today_utc = dt.datetime.now(dt.UTC).date()
-    day = today_utc - dt.timedelta(days=days_ago)
-    start = dt.datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=dt.UTC)
-    end   = dt.datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=dt.UTC)
-    return start, end
+# -------- OpenAQ helpers (same spirit as local_smoketest) --------
+def list_locations_in_bbox(s: requests.Session, bbox: str, limit=1000) -> List[dict]:
+    params = {"bbox": bbox, "parameters_id": PARAMETER_ID, "limit": limit, "page": 1}
+    r = get_with_backoff(s, f"{OPENAQ_BASE}/locations", params=params)
+    return r.json().get("results", [])
 
-def _pick_dt_utc(item: Dict) -> str | None:
+def list_pm25_sensors_for_location(s: requests.Session, location_id: int, per_location_limit=50) -> List[dict]:
+    url = f"{OPENAQ_BASE}/locations/{location_id}/sensors"
+    params = {"limit": per_location_limit, "page": 1}
+    r = get_with_backoff(s, url, params=params)
+    sensors = r.json().get("results", [])
+    out = []
+    for sr in sensors:
+        pid = sr.get("parameter_id") or (sr.get("parameter") or {}).get("id")
+        code = (sr.get("parameter") or {}).get("code") or ""
+        if pid == PARAMETER_ID or str(code).lower().replace(" ", "") in {"pm25", "pm2.5", "pm2_5"}:
+            unit_hint = (sr.get("unit")
+                         or (sr.get("parameter") or {}).get("preferredUnit")
+                         or (sr.get("parameter") or {}).get("unit"))
+            if unit_hint:
+                sr["_unit_hint"] = unit_hint
+            out.append(sr)
+    return out
+
+def latest_for_location(s: requests.Session, location_id: int) -> dict:
+    r = get_with_backoff(s, f"{OPENAQ_BASE}/locations/{location_id}/latest", params={"limit": 1})
+    j = r.json().get("results")
+    if isinstance(j, list) and j:
+        return j[0]
+    return j or {}
+
+def _pick_datetime_from_measurement(m: dict) -> Optional[str]:
     """
-    Prefer OpenAQ v3 'date.utc'; fall back to 'period.datetimeTo.utc' (seen in your smoketest),
-    then a few common aliases.
-    Returns an ISO8601 UTC string or None.
+    Robust timestamp extraction for 'latest' payloads.
+    Prefer explicit fields; fall back to period/coverage datetimeTo.utc.
     """
-    # 1) canonical
-    v = (item.get("date") or {}).get("utc")
-    if isinstance(v, str) and v:
-        return v
-
-    # 2) period window
-    period = item.get("period") or {}
+    if not isinstance(m, dict):
+        return None
+    # explicit
+    for k in ("datetime_utc", "datetime", "date_utc", "timestamp", "observed_at", "observedAt"):
+        v = m.get(k)
+        if isinstance(v, str) and v:
+            return v
+    # nested 'date'
+    d = m.get("date") or {}
+    for k in ("utc", "UTC", "iso"):
+        v = d.get(k)
+        if isinstance(v, str) and v:
+            return v
+    # period datetimeTo.utc
+    period = m.get("period") or {}
     dt_to = (period.get("datetimeTo") or {}).get("utc")
     if isinstance(dt_to, str) and dt_to:
         return dt_to
+    # coverage datetimeTo.utc
+    cov = m.get("coverage") or {}
+    dt_to2 = (cov.get("datetimeTo") or {}).get("utc")
+    if isinstance(dt_to2, str) and dt_to2:
+        return dt_to2
+    # period datetimeFrom.utc (last resort)
     dt_from = (period.get("datetimeFrom") or {}).get("utc")
     if isinstance(dt_from, str) and dt_from:
         return dt_from
-
-    # 3) other aliases occasionally present
-    for k in ("datetime_utc", "date_utc", "timestamp", "datetime"):
-        v = item.get(k)
-        if isinstance(v, str) and v:
-            return v
-
     return None
 
-def fetch_openaq_day(location_id: int, parameter: str,
-                     date_from: dt.datetime, date_to: dt.datetime) -> pd.DataFrame:
+def is_pm25(m: dict) -> bool:
+    pid = m.get("parameter_id") or (m.get("parameter") or {}).get("id")
+    code = (m.get("parameter") or {}).get("code") or m.get("parameter") or ""
+    if pid == PARAMETER_ID:
+        return True
+    if isinstance(code, str) and code.lower().replace(" ", "") in {"pm25", "pm2.5", "pm2_5"}:
+        return True
+    return False
+
+# -------- BigQuery --------
+def ensure_table(bq: bigquery.Client, table_fq: str):
+    table = bigquery.Table(table_fq)
+    table.schema = [
+        bigquery.SchemaField("location_id", "INT64"),
+        bigquery.SchemaField("sensor_id",   "INT64"),
+        bigquery.SchemaField("parameter",   "STRING"),
+        bigquery.SchemaField("value",       "FLOAT"),
+        bigquery.SchemaField("unit",        "STRING"),
+        bigquery.SchemaField("datetime_utc","TIMESTAMP"),
+        bigquery.SchemaField("location_name","STRING"),
+        bigquery.SchemaField("lat",         "FLOAT"),
+        bigquery.SchemaField("lon",         "FLOAT"),
+        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+        bigquery.SchemaField("source",      "STRING"),
+    ]
+    table.time_partitioning = bigquery.TimePartitioning(field="datetime_utc")
+    try:
+        bq.get_table(table_fq)
+    except Exception:
+        bq.create_table(table)
+
+def upsert_rows(bq: bigquery.Client, table_fq: str, rows: List[Dict[str, Any]]):
+    if not rows:
+        return 0
+    # Stage rows to a temp table (loads are cheaper), then MERGE into target
+    job_id = f"openaq_stage_{int(time.time())}"
+    stage_table = f"{table_fq}_stage_{job_id}"
+    schema = [
+        bigquery.SchemaField("location_id", "INT64"),
+        bigquery.SchemaField("sensor_id",   "INT64"),
+        bigquery.SchemaField("parameter",   "STRING"),
+        bigquery.SchemaField("value",       "FLOAT"),
+        bigquery.SchemaField("unit",        "STRING"),
+        bigquery.SchemaField("datetime_utc","TIMESTAMP"),
+        bigquery.SchemaField("location_name","STRING"),
+        bigquery.SchemaField("lat",         "FLOAT"),
+        bigquery.SchemaField("lon",         "FLOAT"),
+        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+        bigquery.SchemaField("source",      "STRING"),
+    ]
+    bq.create_table(bigquery.Table(stage_table, schema=schema))
+    bq.load_table_from_json(rows, stage_table).result()
+
+    merge_sql = f"""
+    MERGE `{table_fq}` T
+    USING `{stage_table}` S
+    ON T.location_id = S.location_id
+       AND T.parameter = S.parameter
+       AND T.datetime_utc = S.datetime_utc
+    WHEN MATCHED THEN UPDATE SET
+        T.value = S.value, T.unit = S.unit, T.sensor_id = S.sensor_id,
+        T.location_name = S.location_name, T.lat = S.lat, T.lon = S.lon,
+        T.ingested_at = S.ingested_at, T.source = S.source
+    WHEN NOT MATCHED THEN INSERT ROW;
     """
-    OpenAQ v3 /measurements for one UTC-day window with pagination.
-    """
-    headers = {}
-    if OPENAQ_API_KEY:
-        headers["X-API-Key"] = OPENAQ_API_KEY
+    bq.query(merge_sql, location=BQ_LOCATION).result()
+    bq.delete_table(stage_table, not_found_ok=True)
+    return len(rows)
 
-    limit = 1000
-    page  = 1
-    rows: List[Dict] = []
+# -------- main sweep --------
+def pick_locations(locs: List[dict], n: int) -> List[dict]:
+    out = []
+    for L in locs:
+        name = str(L.get("name", "")).lower()
+        if any(x in name for x in ("ebam","temporary","decommissioned","pilot","test","unit","mammoth","gbuapcd")):
+            continue
+        out.append(L)
+    return out[:n]
 
-    while True:
-        params = {
-            "location_id": location_id,
-            "parameter": parameter,
-            "date_from": date_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "date_to":   date_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "limit": limit,
-            "page":  page,
-        }
-        url = f"{OPENAQ_BASE}/measurements"
-        r = requests.get(url, headers=headers, params=params, timeout=60)
+def run() -> int:
+    if not PROJECT_ID:
+        print("GOOGLE_CLOUD_PROJECT not set", file=sys.stderr)
+        return 2
+    if not OPENAQ_API_KEY:
+        print("OPENAQ_API_KEY missing (secret)", file=sys.stderr)
+        return 2
 
-        # If a day has no data, v3 often returns 404; treat as empty page.
-        if r.status_code == 404:
-            break
-        r.raise_for_status()
-        payload = r.json()
+    client = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
+    table_fq = f"{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+    ensure_table(client, table_fq)
 
-        data = payload.get("results", [])
-        if not data:
-            break
+    s = build_session()
+    bboxes = [b.strip() for b in BBOXES.split("|") if b.strip()]
+    rows: List[Dict[str, Any]] = []
+    now = dt.datetime.now(dt.UTC)
 
-        for item in data:
-            when = _pick_dt_utc(item)
+    for bbox in bboxes:
+        print(f"Finding PM2.5 locations in bbox: {bbox}", flush=True)
+        try:
+            locs = list_locations_in_bbox(s, bbox)
+        except requests.HTTPError as e:
+            print(f"  ERROR listing locations: {e}", flush=True)
+            continue
+
+        chosen = pick_locations(locs, PER_BBOX)
+        for loc in chosen:
+            loc_id = loc.get("id")
+            loc_name = loc.get("name", "")
+            coords = loc.get("coordinates") or {}
+            lat = coords.get("latitude")
+            lon = coords.get("longitude")
+
+            # Grab sensors to infer unit if latest lacks it
+            unit_hint = None
+            try:
+                sens = list_pm25_sensors_for_location(s, loc_id, per_location_limit=20)
+                if sens:
+                    unit_hint = sens[0].get("_unit_hint")
+            except requests.HTTPError:
+                pass
+
+            try:
+                latest = latest_for_location(s, loc_id)
+            except requests.HTTPError as e:
+                print(f"  WARN latest for location {loc_id}: {e}", flush=True)
+                continue
+
+            # measurements[]: pick PM2.5 and extract value + datetime
+            ms = latest.get("measurements") or []
+            pm25 = [m for m in ms if is_pm25(m)]
+            if not pm25:
+                time.sleep(SLEEP_MS/1000.0)
+                continue
+
+            # choose the most recent by parsed timestamp
+            def k(m: dict):
+                sdt = _pick_datetime_from_measurement(m) or ""
+                try:
+                    if sdt.endswith("Z"):
+                        return dt.datetime.fromisoformat(sdt.replace("Z","+00:00"))
+                    return dt.datetime.fromisoformat(sdt).astimezone(dt.UTC)
+                except Exception:
+                    return dt.datetime.min.replace(tzinfo=dt.UTC)
+
+            best = max(pm25, key=k)
+            when = _pick_datetime_from_measurement(best)
+            if not when:
+                # skip if we truly couldn't find a timestamp
+                time.sleep(SLEEP_MS/1000.0)
+                continue
+
+            val  = best.get("value")
+            unit = best.get("unit") or unit_hint or "µg/m³"
+            sid  = best.get("sensor_id") or best.get("sensorId")
+
             rows.append({
-                "location_id":   (item.get("location") or {}).get("id") or location_id,
-                "location_name": (item.get("location") or {}).get("name"),
-                "parameter":     item.get("parameter"),
-                "unit":          item.get("unit"),
-                "value":         item.get("value"),
-                "datetime_utc":  when,
-                "coordinates_lat": (item.get("coordinates") or {}).get("latitude"),
-                "coordinates_lon": (item.get("coordinates") or {}).get("longitude"),
-                "source_name":   item.get("sourceName"),
+                "location_id":  loc_id,
+                "sensor_id":    sid,
+                "parameter":    PARAMETER_CODE,
+                "value":        val,
+                "unit":         unit,
+                "datetime_utc": when,          # TIMESTAMP column accepts RFC3339
+                "location_name": loc_name,
+                "lat":          lat,
+                "lon":          lon,
+                "ingested_at":  now.isoformat(),
+                "source":       "openaq_latest_v3",
             })
 
-        meta  = payload.get("meta", {})
-        found = meta.get("found")
-        if found is None:
-            if len(data) < limit:
-                break
-        else:
-            pages = math.ceil(int(found) / limit)
-            if page >= pages:
-                break
-        page += 1
+            time.sleep(SLEEP_MS/1000.0)
 
     if not rows:
-        return pd.DataFrame(columns=[
-            "location_id","location_name","parameter","unit","value",
-            "datetime_utc","coordinates_lat","coordinates_lon","source_name"
-        ])
+        print("No OpenAQ rows fetched for the requested sweep. Exiting gracefully.")
+        return 0
 
-    df = pd.DataFrame(rows)
-
-    # Cast / clean
-    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
-    df["location_id"]  = pd.to_numeric(df["location_id"], errors="coerce").astype("Int64")
-
-    # Key must exist
-    df = df.dropna(subset=["location_id", "parameter", "datetime_utc"])
-
-    # (Optional) Helpful fields for later joins
-    df["date"]    = df["datetime_utc"].dt.date
-    df["epiweek"] = df["datetime_utc"].dt.isocalendar().week.astype("Int64") + \
-                    (df["datetime_utc"].dt.isocalendar().year.astype("Int64") * 100)
-    return df
-
-def ensure_table(client: bigquery.Client, full_table_id: str) -> None:
-    """Create the table if it does not exist (idempotent)."""
-    try:
-        client.get_table(full_table_id)
-        return
-    except Exception:
-        pass
-
-    schema = [
-        bigquery.SchemaField("location_id",    "INT64",    mode="REQUIRED"),
-        bigquery.SchemaField("location_name",  "STRING"),
-        bigquery.SchemaField("parameter",      "STRING",   mode="REQUIRED"),
-        bigquery.SchemaField("unit",           "STRING"),
-        bigquery.SchemaField("value",          "FLOAT64"),
-        bigquery.SchemaField("datetime_utc",   "TIMESTAMP",mode="REQUIRED"),
-        bigquery.SchemaField("coordinates_lat","FLOAT64"),
-        bigquery.SchemaField("coordinates_lon","FLOAT64"),
-        bigquery.SchemaField("source_name",    "STRING"),
-        # convenience fields to ease downstream joins/aggregations
-        bigquery.SchemaField("date",           "DATE"),
-        bigquery.SchemaField("epiweek",        "INT64"),
-        bigquery.SchemaField("inserted_at",    "TIMESTAMP",
-                             default_value_expression="CURRENT_TIMESTAMP()"),
-    ]
-    table = bigquery.Table(full_table_id, schema=schema)
-    client.create_table(table)
-    print(f"Created table {full_table_id}")
-
-def merge_upsert(client: bigquery.Client, staging_id: str, target_id: str) -> None:
-    """
-    Upsert using (location_id, parameter, datetime_utc) as the key.
-    """
-    sql = f"""
-    MERGE `{target_id}` T
-    USING `{staging_id}` S
-      ON  T.location_id  = S.location_id
-      AND T.parameter    = S.parameter
-      AND T.datetime_utc = S.datetime_utc
-    WHEN MATCHED THEN UPDATE SET
-      location_name  = S.location_name,
-      unit           = S.unit,
-      value          = S.value,
-      coordinates_lat= S.coordinates_lat,
-      coordinates_lon= S.coordinates_lon,
-      source_name    = S.source_name,
-      date           = S.date,
-      epiweek        = S.epiweek,
-      inserted_at    = CURRENT_TIMESTAMP()
-    WHEN NOT MATCHED THEN
-      INSERT (location_id, location_name, parameter, unit, value,
-              datetime_utc, coordinates_lat, coordinates_lon, source_name,
-              date, epiweek, inserted_at)
-      VALUES (S.location_id, S.location_name, S.parameter, S.unit, S.value,
-              S.datetime_utc, S.coordinates_lat, S.coordinates_lon, S.source_name,
-              S.date, S.epiweek, CURRENT_TIMESTAMP());
-    """
-    client.query(sql, location=BQ_LOCATION).result()
-
-def main():
-    client = bigquery.Client(project=PROJECT, location=BQ_LOCATION)
-    full_table_id = f"{PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
-    ensure_table(client, full_table_id)
-
-    all_days: List[pd.DataFrame] = []
-    for d in range(START_DAYS_AGO, END_DAYS_AGO - 1, -1):
-        start_dt, end_dt = day_bounds_utc(d)
-        print(f"[OpenAQ] {start_dt.isoformat()} → {end_dt.isoformat()} UTC "
-              f"(loc_id={OPENAQ_LOCATION_ID}, param={OPENAQ_PARAMETER})")
-        df = fetch_openaq_day(OPENAQ_LOCATION_ID, OPENAQ_PARAMETER, start_dt, end_dt)
-        if not df.empty:
-            all_days.append(df)
-
-    if not all_days:
-        print("No OpenAQ rows fetched for the requested window. Exiting gracefully.")
-        return
-
-    df_all = pd.concat(all_days, ignore_index=True).drop_duplicates(
-        subset=["location_id","parameter","datetime_utc"]
-    )
-    print(f"OpenAQ rows prepared: {len(df_all)}")
-
-    staging_id = f"{PROJECT}.{BQ_DATASET}._openaq_stage_{int(time.time())}"
-    job_cfg = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
-    client.load_table_from_dataframe(df_all, staging_id, job_config=job_cfg,
-                                     location=BQ_LOCATION).result()
-
-    merge_upsert(client, staging_id, full_table_id)
-    client.delete_table(staging_id, not_found_ok=True)
-    print(f"Upserted {len(df_all)} rows into {full_table_id}")
+    n = upsert_rows(client, table_fq, rows)
+    print(f"Upserted {n} OpenAQ 'latest' rows into {table_fq}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run())
