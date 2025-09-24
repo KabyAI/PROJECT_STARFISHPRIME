@@ -1,115 +1,148 @@
-import os, sys, time, json, math
-from datetime import date, timedelta, datetime
-import requests
+import os, sys, time, math
+from datetime import datetime, timedelta, date
+from typing import List, Tuple
 import pandas as pd
+import requests
 from google.cloud import bigquery
 
-PROJECT   = os.environ["GOOGLE_CLOUD_PROJECT"]
-BQ_DATASET= os.environ.get("BQ_DATASET","silver")
-BQ_TABLE  = os.environ.get("BQ_TABLE","weather_ca_daily")
-BQ_LOC    = os.environ.get("BQ_LOCATION","europe-north2")
-TIMEZONE  = os.environ.get("TIMEZONE","America/Los_Angeles")
+PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
+if not PROJECT:
+    print("FATAL: GOOGLE_CLOUD_PROJECT (or PROJECT_ID) is not set.", file=sys.stderr)
+    sys.exit(1)
 
-POINTS    = os.environ.get("POINTS","34.05,-118.24").split(";")
-DAYS_BACK = int(os.environ.get("DAYS_BACK","31"))
-START_DATE= os.environ.get("START_DATE","").strip()
+BQ_DATASET     = os.getenv("BQ_DATASET", "silver")
+BQ_TABLE_POINTS= os.getenv("BQ_TABLE_POINTS", "weather_points_daily")
+BQ_LOCATION    = os.getenv("BQ_LOCATION", "europe-north2")
+POINTS         = os.getenv("POINTS", "")
+DAYS_BACK      = int(os.getenv("DAYS_BACK", "31"))
+START_DATE_S   = os.getenv("START_DATE", "").strip()
+TZ             = os.getenv("TIMEZONE", "America/Los_Angeles")
 
-API_URL   = "https://api.open-meteo.com/v1/forecast"
-DAILY_VARS= "temperature_2m_max,temperature_2m_min,temperature_2m_mean"
+BASE = "https://api.open-meteo.com/v1/forecast"
 
-def daterange(start: date, end: date):
-    for n in range(int((end - start).days) + 1):
-        yield start + timedelta(n)
+def parse_points(s: str) -> List[Tuple[float,float,str]]:
+    pts = []
+    labels = ["sj","sac","sd","la","sf","fresno"]
+    for i, part in enumerate([p for p in s.split(";") if p.strip()]):
+        lat_s, lon_s = part.split(",")
+        pts.append((float(lat_s), float(lon_s), labels[i] if i < len(labels) else f"p{i+1}"))
+    return pts
 
-def fetch_point(lat, lon, start_d: date, end_d: date):
+def daterange(start: date, end: date) -> List[str]:
+    d = start
+    out = []
+    while d <= end:
+        out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+def fetch_daily(lat: float, lon: float, tz: str, d0: date, d1: date) -> pd.DataFrame:
     params = {
         "latitude": lat, "longitude": lon,
-        "daily": DAILY_VARS,
-        "timezone": TIMEZONE,
-        "start_date": start_d.isoformat(),
-        "end_date": end_d.isoformat(),
+        "timezone": tz,
+        "daily": ["temperature_2m_mean","temperature_2m_max","temperature_2m_min"],
+        "start_date": d0.isoformat(),
+        "end_date": d1.isoformat(),
     }
-    r = requests.get(API_URL, params=params, timeout=30)
+    r = requests.get(BASE, params=params, timeout=60)
     r.raise_for_status()
     j = r.json()
-    d = j.get("daily", {})
-    df = pd.DataFrame(d)
-    # expected columns: time, temperature_2m_max, temperature_2m_min, temperature_2m_mean
-    if df.empty: return df
-    df.rename(columns={"time":"date"}, inplace=True)
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    df["lat"] = float(lat); df["lon"] = float(lon)
+    if "daily" not in j:
+        return pd.DataFrame()
+    daily = j["daily"]
+    df = pd.DataFrame({
+        "date": pd.to_datetime(daily["time"]).dt.date,
+        "temp_mean": daily.get("temperature_2m_mean"),
+        "temp_max": daily.get("temperature_2m_max"),
+        "temp_min": daily.get("temperature_2m_min"),
+    })
+    df["lat"] = lat
+    df["lon"] = lon
     return df
 
-def ensure_table(client: bigquery.Client, table_id: str):
-    from google.cloud.bigquery import SchemaField, TimePartitioning
+def ensure_points_table(client: bigquery.Client, table_id: str):
     try:
-        client.get_table(table_id)
-        return
+        client.get_table(table_id); return
     except Exception:
-        schema = [
-            bigquery.SchemaField("date","DATE",mode="REQUIRED"),
-            bigquery.SchemaField("region","STRING",mode="REQUIRED"),
-            bigquery.SchemaField("temp_mean","FLOAT"),
-            bigquery.SchemaField("temp_max","FLOAT"),
-            bigquery.SchemaField("temp_min","FLOAT"),
-            bigquery.SchemaField("inserted_at","TIMESTAMP"),
-        ]
-        table = bigquery.Table(table_id, schema=schema)
-        table.time_partitioning = bigquery.TimePartitioning(field="date")
-        client.create_table(table)
-        print(f"Created {table_id}", file=sys.stderr)
+        pass
+    schema = [
+        bigquery.SchemaField("date", "DATE", mode="REQUIRED"),
+        bigquery.SchemaField("region_label", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("point_id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("lat", "FLOAT64"),
+        bigquery.SchemaField("lon", "FLOAT64"),
+        bigquery.SchemaField("temp_mean", "FLOAT64"),
+        bigquery.SchemaField("temp_max", "FLOAT64"),
+        bigquery.SchemaField("temp_min", "FLOAT64"),
+        bigquery.SchemaField("inserted_at", "TIMESTAMP",
+                             default_value_expression="CURRENT_TIMESTAMP()"),
+    ]
+    tbl = bigquery.Table(table_id, schema=schema)
+    tbl.time_partitioning = bigquery.TimePartitioning(field="date")
+    client.create_table(tbl)
+    print(f"Created {table_id}")
 
-def upsert(client: bigquery.Client, df: pd.DataFrame, table_id: str):
-    stg = f"{table_id}__stg"
-    job = client.load_table_from_dataframe(df, stg, job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"))
+def upsert_points(client: bigquery.Client, df: pd.DataFrame, table_id: str):
+    stg = f"{table_id.replace('.', '._stg_')}_{int(time.time())}"
+    job = client.load_table_from_dataframe(
+        df,
+        stg,
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
+        location=BQ_LOCATION,
+    )
     job.result()
+
     sql = f"""
     MERGE `{table_id}` T
-    USING (
-      SELECT DATE(date) AS date, 'ca' AS region,
-             AVG(temperature_2m_mean) AS temp_mean,
-             AVG(temperature_2m_max)  AS temp_max,
-             AVG(temperature_2m_min)  AS temp_min,
-             CURRENT_TIMESTAMP() AS inserted_at
-      FROM `{stg}`
-      GROUP BY date
-    ) S
-    ON T.date = S.date AND T.region = S.region
+    USING `{stg}` S
+    ON  T.date = S.date AND T.point_id = S.point_id
     WHEN MATCHED THEN UPDATE SET
-      temp_mean=S.temp_mean, temp_max=S.temp_max, temp_min=S.temp_min, inserted_at=S.inserted_at
-    WHEN NOT MATCHED THEN
-      INSERT (date,region,temp_mean,temp_max,temp_min,inserted_at)
-      VALUES (S.date,S.region,S.temp_mean,S.temp_max,S.temp_min,S.inserted_at)
+      temp_mean = S.temp_mean,
+      temp_max  = S.temp_max,
+      temp_min  = S.temp_min,
+      lat       = S.lat,
+      lon       = S.lon,
+      inserted_at = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN INSERT (
+      date, region_label, point_id, lat, lon, temp_mean, temp_max, temp_min, inserted_at
+    ) VALUES (
+      S.date, S.region_label, S.point_id, S.lat, S.lon, S.temp_mean, S.temp_max, S.temp_min, CURRENT_TIMESTAMP()
+    );
     """
-    client.query(sql, location=BQ_LOC).result()
+    client.query(sql, location=BQ_LOCATION).result()
     client.delete_table(stg, not_found_ok=True)
 
 def main():
-    client = bigquery.Client(project=PROJECT)
-    table_id = f"{PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
-    ensure_table(client, table_id)
+    client = bigquery.Client(project=PROJECT, location=BQ_LOCATION)
+    table_id = f"{PROJECT}.{BQ_DATASET}.{BQ_TABLE_POINTS}"
+    ensure_points_table(client, table_id)
+
+    pts = parse_points(POINTS)
+    if not pts:
+        print("No POINTS provided.", file=sys.stderr); sys.exit(1)
 
     today = date.today()
-    if START_DATE:
-        start_d = date.fromisoformat(START_DATE)
+    if START_DATE_S:
+        start_d = date.fromisoformat(START_DATE_S)
     else:
         start_d = today - timedelta(days=DAYS_BACK)
     end_d = today
 
-    all_rows = []
-    for p in POINTS:
-        lat, lon = p.split(",")
-        df = fetch_point(lat.strip(), lon.strip(), start_d, end_d)
-        if not df.empty: all_rows.append(df)
-        time.sleep(0.2)  # be nice
+    rows = []
+    for lat, lon, pid in pts:
+        df = fetch_daily(lat, lon, TZ, start_d, end_d)
+        if df.empty: continue
+        df["region_label"] = "ca"
+        df["point_id"] = pid
+        rows.append(df)
 
-    if not all_rows:
-        print("No data fetched", file=sys.stderr); return
+    if not rows:
+        print("No weather rows fetched. Exiting."); return
 
-    df_all = pd.concat(all_rows).reset_index(drop=True)
-    upsert(client, df_all, table_id)
-    print(f"Upserted {len(df_all)} rows into {table_id}")
+    df_all = pd.concat(rows, ignore_index=True)
+    # Keep raw per-point in silver
+    upsert_points(client, df_all, table_id)
+    print(f"Upserted {len(df_all)} weather point-days into {table_id}")
 
 if __name__ == "__main__":
     main()

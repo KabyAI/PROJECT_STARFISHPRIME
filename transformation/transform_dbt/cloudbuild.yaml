@@ -1,0 +1,18 @@
+# transformation/transform_dbt/cloudbuild.yaml
+substitutions:
+  _REGION: europe-north2
+  _REPO: starfish-docker
+  _TAG: latest
+
+steps:
+- name: gcr.io/cloud-builders/docker
+  args:
+    - build
+    - -t
+    - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/transform-dbt:${_TAG}
+    - -f
+    - Dockerfile
+    - .
+
+images:
+- ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/transform-dbt:${_TAG}

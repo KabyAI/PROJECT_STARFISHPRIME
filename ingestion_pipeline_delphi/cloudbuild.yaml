@@ -1,5 +1,12 @@
 steps:
-  - name: 'gcr.io/cloud-builders/docker'
-    args: ['build','-t','$_IMAGE','-f','ingestion_pipeline_delphi/Dockerfile','ingestion_pipeline_delphi']
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/ingest-delphi:4"
+      - "."
 images:
-  - '$_IMAGE'
+  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/ingest-delphi:4"
+substitutions:
+  _REGION: "europe-north2"
+  _REPO: "starfish-docker"

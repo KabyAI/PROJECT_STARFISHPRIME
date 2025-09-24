@@ -1,0 +1,14 @@
+name: "transform"
+version: "1.0"
+profile: "transform"     # <-- must match the profile name in profiles.yml
+model-paths: ["models"]
+seed-paths:  ["seeds"]
+macro-paths: ["macros"]
+
+models:
+  transform:
+    +materialized: view
+    silver:
+      +schema: silver
+    gold:
+      +schema: gold

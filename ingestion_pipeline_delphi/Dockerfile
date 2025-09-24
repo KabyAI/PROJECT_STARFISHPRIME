@@ -1,7 +1,10 @@
 FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-COPY ingestion_delphi.py ./
+
 ENV PYTHONUNBUFFERED=1
-CMD ["python", "ingestion_delphi.py"]
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY ingestion_delphi.py .
+CMD ["python", "-u", "ingestion_delphi.py"]
