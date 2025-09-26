@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: flu_weather_ca_join
+    columns:
+      - name: epiweek
+        tests: [not_null]
+      - name: region
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['ca', 'state:ca']
+      - name: wili
+        tests:
+          - non_negative
+      - name: ili
+        tests:
+          - non_negative
+
+  - name: openaq_pm25_with_weather
+    columns:
+      - name: measurement_date
+        tests: [not_null]
+      - name: location_id
+        tests: [not_null]
+      - name: pm25_avg
+        tests:
+          - non_negative

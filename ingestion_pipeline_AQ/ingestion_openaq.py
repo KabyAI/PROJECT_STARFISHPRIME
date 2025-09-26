@@ -342,6 +342,14 @@ def load_rows(
     client.query(merge_sql, location=location).result()
     print(f"[BQ] MERGE into {target_fq} completed.", flush=True)
 
+    try:
+        count_sql = f"SELECT COUNT(*) AS row_count FROM `{target_fq}`"
+        result = client.query(count_sql, location=location).result()
+        row_count = next(iter(result))["row_count"] if result.total_rows else 0
+        print(f"[BQ] {target_fq} row count now {row_count}", flush=True)
+    except Exception as exc:  # pragma: no cover - verification aid only
+        print(f"[WARN] Unable to fetch row count for {target_fq}: {exc}", flush=True)
+
 
 # --------------- main ----------------------------------------
 def parse_bboxes(env_str: Optional[str]) -> List[str]:

@@ -1,17 +1,17 @@
-{{ config(materialized='view') }}
+{{ config(materialized='view', schema=env_var('DBT_GOLD','gold')) }}
 
-WITH f AS (
-  SELECT region, epiweek, wili, ili, num_ili, num_patients, release_date
-  FROM `{{ env_var('PROJECT', var('project', target.project)) }}.{{ env_var('DBT_SILVER','silver') }}.fluview_test`
-  WHERE region IN ('ca','state:ca')
-),
-w AS (
-  SELECT region, epiweek, temp_mean_epiwk, temp_max_epiwk, temp_min_epiwk
-  FROM {{ ref('weather_ca_epiweek') }}
+WITH flu AS (
+  SELECT *
+  FROM `{{ env_var('PROJECT', env_var('GOOGLE_CLOUD_PROJECT')) }}.{{ env_var('DBT_SILVER','silver') }}`.fluview_ca_weekly
+), weather AS (
+  SELECT *
+  FROM `{{ env_var('PROJECT', env_var('GOOGLE_CLOUD_PROJECT')) }}.{{ env_var('DBT_SILVER','silver') }}`.weather_ca_epiweek
 )
+
 SELECT
   f.region,
   f.epiweek,
+  f.week_start,
   f.wili,
   f.ili,
   f.num_ili,
@@ -20,6 +20,8 @@ SELECT
   w.temp_mean_epiwk,
   w.temp_max_epiwk,
   w.temp_min_epiwk
-FROM f
-LEFT JOIN w
-  ON w.region = 'ca' AND w.epiweek = f.epiweek
+FROM flu f
+LEFT JOIN weather w
+  ON w.region = f.region
+ AND w.epiweek = f.epiweek
+WHERE f.region IN ('ca', 'state:ca')

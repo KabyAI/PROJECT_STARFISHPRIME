@@ -1,12 +1,63 @@
+substitutions:
+  _REGION: 'europe-north2'
+  _REPO: 'starfish-docker'
+  _JOB_NAME: 'ingest-delphi'
+  _RAW_DATASET: 'raw'
+  _DELPHI_TABLE: 'fluview_ca_weekly'
+  _DELPHI_START_DATE: '2022-01-03'
+  _IMAGE_TAG: '$SHORT_SHA'
+  _SERVICE_ACCOUNT: 'cloud-run-ingest@${PROJECT_ID}.iam.gserviceaccount.com'
+
 steps:
+  - name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |-
+        set -euxo pipefail
+        pip install --upgrade pip
+        pip install -r ingestion_pipeline_delphi/requirements.txt pytest
+        export PYTHONPATH="$PWD"
+        pytest tests/test_ingestion_delphi.py
+
   - name: gcr.io/cloud-builders/docker
     args:
       - build
-      - "-t"
-      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/ingest-delphi:4"
-      - "."
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_JOB_NAME}:${_IMAGE_TAG}'
+      - '-f'
+      - ingestion_pipeline_delphi/Dockerfile
+      - ingestion_pipeline_delphi
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |-
+        set -euxo pipefail
+        python3 - <<'PY'
+        import os
+        from pathlib import Path
+        from string import Template
+
+        template_path = Path('ingestion_pipeline_delphi/job.env.yaml')
+        rendered_path = Path('job.env.rendered.yaml')
+        rendered_path.write_text(Template(template_path.read_text()).safe_substitute(os.environ), encoding='utf-8')
+        PY
+
+        COMMIT=${COMMIT_SHA:-local}
+        gcloud config set project ${PROJECT_ID}
+        gcloud run jobs deploy ${_JOB_NAME} \
+          --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_JOB_NAME}:${_IMAGE_TAG} \
+          --region=${_REGION} \
+          --env-vars-file=job.env.rendered.yaml \
+          --set-env-vars=IMAGE_TAG=${_IMAGE_TAG},COMMIT_SHA=${COMMIT} \
+          --service-account=${_SERVICE_ACCOUNT} \
+          --memory=2Gi \
+          --max-retries=3 \
+          --execution-environment=gen2
+
+        gcloud run jobs describe ${_JOB_NAME} --region=${_REGION}
+
 images:
-  - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/ingest-delphi:4"
-substitutions:
-  _REGION: "europe-north2"
-  _REPO: "starfish-docker"
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_JOB_NAME}:${_IMAGE_TAG}'

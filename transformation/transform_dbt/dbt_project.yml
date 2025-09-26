@@ -1,14 +1,21 @@
 name: "transform"
-version: "1.0"
-profile: "transform"     # <-- must match the profile name in profiles.yml
+version: "1.0.0"
+config-version: 2
+
+profile: "transform"
+
 model-paths: ["models"]
-seed-paths:  ["seeds"]
 macro-paths: ["macros"]
+seed-paths: ["seeds"]  # unused now (no CSV), but harmless
 
 models:
   transform:
     +materialized: view
+
     silver:
-      +schema: silver
+      +schema: "{{ env_var('DBT_SILVER', 'silver') }}"
+      +materialized: view
+
     gold:
-      +schema: gold
+      +schema: "{{ env_var('DBT_GOLD', 'gold') }}"
+      +materialized: view

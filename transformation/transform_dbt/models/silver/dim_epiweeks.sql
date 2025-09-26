@@ -1,9 +1,5 @@
-{{ config(
-    materialized='table',
-    schema=env_var('DBT_SILVER', 'silver')
-) }}
+{{ config(materialized='table', schema=env_var('DBT_SILVER', 'silver')) }}
 
--- Build ~6 years of epiweeks (adjust with DBT_WEEKS_BACK if you want)
 WITH params AS (
   SELECT CAST({{ env_var('DBT_WEEKS_BACK', '312') }} AS INT64) AS weeks_back
 ),

@@ -4,8 +4,8 @@ transform:
     prod:
       type: bigquery
       method: oauth
-      project: "{{ env_var('GOOGLE_CLOUD_PROJECT') }}"
-      dataset: silver
-      location: europe-north2
-      threads: 4
+      project: "{{ env_var('PROJECT', env_var('GOOGLE_CLOUD_PROJECT')) }}"
+      dataset: "{{ env_var('DBT_SILVER', 'silver') }}"
+      location: "{{ env_var('REGION', 'europe-north2') }}"
       priority: interactive
+      threads: 4

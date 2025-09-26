@@ -1,0 +1,32 @@
+version: 2
+
+models:
+  - name: openaq_pm25_measurements
+    columns:
+      - name: sensor_id
+        tests:
+          - not_null
+      - name: datetime_utc
+        tests:
+          - not_null
+      - name: pm25_value
+        tests:
+          - not_null
+          - non_negative
+
+  - name: openaq_pm25_daily
+    columns:
+      - name: measurement_date
+        tests:
+          - not_null
+      - name: location_id
+        tests:
+          - not_null
+      - name: pm25_avg
+        tests:
+          - not_null
+          - non_negative
+    tests:
+      - unique_combination:
+          arguments:
+            column_names: [measurement_date, location_id]

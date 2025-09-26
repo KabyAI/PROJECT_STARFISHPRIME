@@ -1,0 +1,36 @@
+name: Nightly ingestion
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch: {}
+
+env:
+  GCP_REGION: europe-north2
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_CLOUD_RUN_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Trigger Cloud Run jobs
+        run: |
+          set -euxo pipefail
+          gcloud run jobs execute ingest-openmeteo --region="${{ env.GCP_REGION }}" --project="${{ secrets.GCP_PROJECT_ID }}"
+          gcloud run jobs execute ingest-delphi --region="${{ env.GCP_REGION }}" --project="${{ secrets.GCP_PROJECT_ID }}"
+          gcloud run jobs execute ingest-openaq --region="${{ env.GCP_REGION }}" --project="${{ secrets.GCP_PROJECT_ID }}"
